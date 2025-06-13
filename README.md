@@ -12,16 +12,17 @@ pip install -r requirements.txt
 # Configure Kubernetes access
 export KUBECONFIG=~/.kube/config
 
-# Run MCP server
-python -m mcp_kubernetes
+# Run MCP server (read-only mode)
+python -m mcp_kubernetes --read-only
 ```
 
 ## Features
 
 - List and inspect Kubernetes resources (pods, services, deployments)
 - View container logs through MCP protocol
-- Basic cluster operations via AI integration
+- Read-only cluster operations via AI integration
 - Secure RBAC-aware resource access
+- Comprehensive pod status and description tools
 
 ## Requirements
 
@@ -32,7 +33,7 @@ python -m mcp_kubernetes
 ## Architecture
 
 ```
-AI Client (Claude, etc.) êí MCP Protocol êí Kubernetes Python Client êí K8s Cluster
+AI Client (Claude, etc.) <-> MCP Protocol <-> Kubernetes Python Client <-> K8s Cluster
 ```
 
 ## Usage
@@ -44,6 +45,12 @@ Connect through any MCP-compatible client:
 resources = mcp_client.list_resources()
 pods = mcp_client.read_resource("k8s://pods")
 ```
+
+## Read-Only Tools
+
+- `get_pod_logs`: Retrieve logs from specific pods
+- `describe_pod`: Get detailed pod information
+- `get_pod_status`: Filter and view pod status
 
 ## Development
 

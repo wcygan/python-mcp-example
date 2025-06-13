@@ -18,24 +18,36 @@ from mcp.types import (
     ReadResourceResult,
 )
 
+from .config import ServerConfig, load_config
+
 logger = logging.getLogger(__name__)
 
 
 class KubernetesMCPServer:
     """MCP server providing Kubernetes cluster management capabilities."""
 
-    def __init__(self, kubeconfig_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None, server_config: Optional[ServerConfig] = None):
         """Initialize the Kubernetes MCP server.
         
         Args:
-            kubeconfig_path: Path to kubeconfig file. If None, uses default config.
+            config_path: Path to configuration file. If None, uses environment or defaults.
+            server_config: Pre-loaded server configuration. Takes precedence over config_path.
         """
-        self.server = Server("kubernetes-mcp")
-        self.kubeconfig_path = kubeconfig_path
+        # Load configuration
+        if server_config:
+            self.config = server_config
+        else:
+            self.config = load_config(config_path)
+        
+        # Initialize MCP server
+        self.server = Server(self.config.mcp.server_name)
         
         # Kubernetes API clients
         self.v1_core: Optional[client.CoreV1Api] = None
         self.v1_apps: Optional[client.AppsV1Api] = None
+        
+        # Setup logging
+        logging.getLogger().setLevel(getattr(logging, self.config.logging.level))
         
         # Setup handlers
         self._setup_handlers()
@@ -115,11 +127,11 @@ class KubernetesMCPServer:
         
         @self.server.list_tools()
         async def list_tools() -> List[Tool]:
-            """List available Kubernetes management tools."""
+            """List available Kubernetes read-only tools."""
             return [
                 Tool(
                     name="get_pod_logs",
-                    description="Get logs from a specific pod",
+                    description="Get logs from a specific pod (read-only)",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -146,40 +158,59 @@ class KubernetesMCPServer:
                     }
                 ),
                 Tool(
-                    name="scale_deployment",
-                    description="Scale a deployment to specified replica count",
+                    name="describe_pod",
+                    description="Get detailed information about a specific pod (read-only)",
                     inputSchema={
                         "type": "object",
                         "properties": {
-                            "deployment_name": {
+                            "pod_name": {
                                 "type": "string",
-                                "description": "Name of the deployment"
+                                "description": "Name of the pod"
                             },
                             "namespace": {
                                 "type": "string",
-                                "description": "Kubernetes namespace", 
+                                "description": "Kubernetes namespace",
                                 "default": "default"
-                            },
-                            "replicas": {
-                                "type": "integer",
-                                "description": "Target number of replicas"
                             }
                         },
-                        "required": ["deployment_name", "replicas"]
+                        "required": ["pod_name"]
+                    }
+                ),
+                Tool(
+                    name="get_pod_status",
+                    description="Get current status of pods matching criteria (read-only)",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "namespace": {
+                                "type": "string",
+                                "description": "Kubernetes namespace to filter by"
+                            },
+                            "label_selector": {
+                                "type": "string",
+                                "description": "Label selector to filter pods (e.g., 'app=nginx')"
+                            },
+                            "field_selector": {
+                                "type": "string",
+                                "description": "Field selector to filter pods (e.g., 'status.phase=Running')"
+                            }
+                        }
                     }
                 )
             ]
         
         @self.server.call_tool()
         async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
-            """Execute Kubernetes management tools."""
+            """Execute Kubernetes read-only tools."""
             await self._ensure_connected()
             
             try:
                 if name == "get_pod_logs":
                     result = await self._get_pod_logs(**arguments)
-                elif name == "scale_deployment":
-                    result = await self._scale_deployment(**arguments)
+                elif name == "describe_pod":
+                    result = await self._describe_pod(**arguments)
+                elif name == "get_pod_status":
+                    result = await self._get_pod_status(**arguments)
                 else:
                     raise ValueError(f"Unknown tool: {name}")
                 
@@ -207,14 +238,24 @@ class KubernetesMCPServer:
         """Ensure connection to Kubernetes cluster."""
         if self.v1_core is None:
             try:
-                if self.kubeconfig_path:
-                    config.load_kube_config(config_file=self.kubeconfig_path)
+                if self.config.kubernetes.use_service_account:
+                    config.load_incluster_config()
+                elif self.config.kubernetes.kubeconfig_path:
+                    config.load_kube_config(
+                        config_file=self.config.kubernetes.kubeconfig_path,
+                        context=self.config.kubernetes.context
+                    )
                 else:
                     # Try in-cluster config first, then local config
                     try:
                         config.load_incluster_config()
                     except config.ConfigException:
-                        config.load_kube_config()
+                        config.load_kube_config(context=self.config.kubernetes.context)
+                
+                # Set timeout configuration
+                configuration = client.Configuration.get_default_copy()
+                configuration.timeout = self.config.kubernetes.timeout
+                client.Configuration.set_default(configuration)
                 
                 self.v1_core = client.CoreV1Api()
                 self.v1_apps = client.AppsV1Api()
@@ -358,29 +399,114 @@ class KubernetesMCPServer:
             logger.error(f"Error getting pod logs: {e}")
             raise
     
-    async def _scale_deployment(self, deployment_name: str, replicas: int, 
-                               namespace: str = "default") -> str:
-        """Scale a deployment to specified replica count."""
+    async def _describe_pod(self, pod_name: str, namespace: str = "default") -> str:
+        """Get detailed information about a specific pod."""
         try:
-            # Get current deployment
-            deployment = self.v1_apps.read_namespaced_deployment(
-                name=deployment_name, 
-                namespace=namespace
-            )
+            pod = self.v1_core.read_namespaced_pod(name=pod_name, namespace=namespace)
             
-            # Update replica count
-            deployment.spec.replicas = replicas
+            # Format pod details as readable text
+            details = {
+                "name": pod.metadata.name,
+                "namespace": pod.metadata.namespace,
+                "status": pod.status.phase,
+                "created": pod.metadata.creation_timestamp,
+                "node": pod.spec.node_name,
+                "pod_ip": pod.status.pod_ip,
+                "host_ip": pod.status.host_ip,
+                "labels": pod.metadata.labels or {},
+                "annotations": pod.metadata.annotations or {},
+                "containers": [],
+                "conditions": []
+            }
             
-            # Apply the change
-            self.v1_apps.patch_namespaced_deployment(
-                name=deployment_name,
-                namespace=namespace,
-                body=deployment
-            )
+            # Add container information
+            if pod.spec.containers:
+                for container in pod.spec.containers:
+                    container_info = {
+                        "name": container.name,
+                        "image": container.image,
+                        "ports": [{"containerPort": p.container_port, "protocol": p.protocol} for p in (container.ports or [])],
+                        "resources": {
+                            "requests": container.resources.requests if container.resources and container.resources.requests else {},
+                            "limits": container.resources.limits if container.resources and container.resources.limits else {}
+                        }
+                    }
+                    details["containers"].append(container_info)
             
-            return f"Successfully scaled deployment {deployment_name} to {replicas} replicas"
+            # Add container status information
+            if pod.status.container_statuses:
+                for i, status in enumerate(pod.status.container_statuses):
+                    if i < len(details["containers"]):
+                        details["containers"][i].update({
+                            "ready": status.ready,
+                            "restart_count": status.restart_count,
+                            "state": str(status.state)
+                        })
+            
+            # Add pod conditions
+            if pod.status.conditions:
+                for condition in pod.status.conditions:
+                    details["conditions"].append({
+                        "type": condition.type,
+                        "status": condition.status,
+                        "reason": condition.reason,
+                        "message": condition.message,
+                        "last_transition_time": condition.last_transition_time
+                    })
+            
+            return json.dumps(details, indent=2, default=str)
         except ApiException as e:
-            logger.error(f"Error scaling deployment: {e}")
+            logger.error(f"Error describing pod: {e}")
+            raise
+    
+    async def _get_pod_status(self, namespace: Optional[str] = None, 
+                             label_selector: Optional[str] = None,
+                             field_selector: Optional[str] = None) -> str:
+        """Get current status of pods matching criteria."""
+        try:
+            kwargs = {}
+            if label_selector:
+                kwargs["label_selector"] = label_selector
+            if field_selector:
+                kwargs["field_selector"] = field_selector
+            
+            if namespace:
+                response = self.v1_core.list_namespaced_pod(namespace=namespace, **kwargs)
+            else:
+                response = self.v1_core.list_pod_for_all_namespaces(**kwargs)
+            
+            pod_statuses = []
+            for pod in response.items:
+                status_info = {
+                    "name": pod.metadata.name,
+                    "namespace": pod.metadata.namespace,
+                    "phase": pod.status.phase,
+                    "ready": "0/0",
+                    "restarts": 0,
+                    "age": pod.metadata.creation_timestamp,
+                    "node": pod.spec.node_name,
+                    "pod_ip": pod.status.pod_ip
+                }
+                
+                # Calculate ready containers
+                if pod.status.container_statuses:
+                    ready_count = sum(1 for c in pod.status.container_statuses if c.ready)
+                    total_count = len(pod.status.container_statuses)
+                    status_info["ready"] = f"{ready_count}/{total_count}"
+                    status_info["restarts"] = sum(c.restart_count for c in pod.status.container_statuses)
+                
+                # Add reason for non-running pods
+                if pod.status.phase != "Running" and pod.status.container_statuses:
+                    for container_status in pod.status.container_statuses:
+                        if container_status.state and container_status.state.waiting:
+                            status_info["reason"] = container_status.state.waiting.reason
+                            break
+                
+                pod_statuses.append(status_info)
+            
+            return json.dumps(pod_statuses, indent=2, default=str)
+        except ApiException as e:
+            logger.error(f"Error getting pod status: {e}")
             raise
     
     async def run_server(self) -> None:
