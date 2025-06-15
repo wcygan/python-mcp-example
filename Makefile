@@ -13,11 +13,23 @@ install-dev: ## Install development dependencies
 	pip install -r requirements-dev.txt
 	pre-commit install
 
-test: ## Run tests
-	pytest
+test: ## Run unit tests only
+	pytest tests/ -k "not integration" -v
+
+test-unit: ## Run unit tests only
+	pytest tests/test_server.py -v
+
+test-integration: ## Run integration tests
+	pytest tests/integration/ -v
+
+test-all: ## Run all tests including integration
+	pytest tests/ -v
 
 test-cov: ## Run tests with coverage
 	pytest --cov=mcp_kubernetes --cov-report=html --cov-report=term
+
+test-integration-safe: ## Run integration tests with safety checks
+	MCP_KUBERNETES_READ_ONLY=true MCP_KUBERNETES_LOG_LEVEL=WARNING pytest tests/integration/ -v
 
 lint: ## Run linting
 	flake8 mcp_kubernetes tests
